@@ -15,7 +15,8 @@ from my_agent.utils.nodes import (
     node_generate_viz,
     node_sentiment_analysis,
     node_forecast,
-    node_rag_search
+    node_rag_search,
+    node_risk_disclaimer
 )
 from my_agent.utils.state import AgentState
 
@@ -34,7 +35,7 @@ workflow.add_node("ask_human", node_ask_user)
 workflow.add_node("sentiment_analyst", node_sentiment_analysis)
 workflow.add_node("forecaster", node_forecast)
 workflow.add_node("rag_search", node_rag_search)
-
+workflow.add_node("risk_disclaimer", node_risk_disclaimer)
 # --- 2. Set Entry Point ---
 workflow.set_entry_point("extractor")
 
@@ -87,7 +88,8 @@ workflow.add_edge("analyst", "forecaster")
 workflow.add_edge("forecaster", "check_style")
 workflow.add_edge("sentiment_analyst", END)
 workflow.add_edge("rag_search", END)
-
+workflow.add_edge("risk_disclaimer", END)
+workflow.add_edge("visualizer", "risk_disclaimer")
 # Conditional Edges
 
 # 1. Extractor -> RAG OR Ticker Check

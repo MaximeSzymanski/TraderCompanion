@@ -130,12 +130,20 @@ if prompt := st.chat_input("Ask about a stock (e.g., 'Analyze Nvidia') or your P
             
             # Run the Graph
             final_state = app.invoke(inputs, config=config)
-            
             bot_response_content = final_state["messages"][-1].content
-            
             # Check for Chart
-            chart_path = extract_chart_path(bot_response_content)
-            
+            chart_path = None
+            for msg in final_state["messages"]:
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                else:
+                    content = msg.content
+
+                path = extract_chart_path(content)
+                if path:
+                    chart_path = path
+                    break
+
             if chart_path:
                 # === RENDER CHART ===
                 message_placeholder.empty() # Clear loading text
@@ -155,7 +163,16 @@ if prompt := st.chat_input("Ask about a stock (e.g., 'Analyze Nvidia') or your P
                     })
                 else:
                     st.error(f"File not found: {chart_path}")
-            
+                # Update bot response to exclude chart path
+                bot_response_content = bot_response_content.replace(chart_path, "").strip()
+                if bot_response_content:
+                    message_placeholder.markdown(bot_response_content)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": bot_response_content,
+                        "is_html": False
+                    })
+                    
             else:
                 # === RENDER TEXT ===
                 message_placeholder.markdown(bot_response_content)

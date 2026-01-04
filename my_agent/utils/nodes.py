@@ -323,6 +323,19 @@ def node_fetch_data(state):
         except Exception as e:
             return {"error_message": f"Error fetching data: {str(e)}"}
 
+def node_risk_disclaimer(state):
+    if state.get("signals") or state.get("forecast_data"):
+        return {
+            "messages": state.get("messages", []) + [
+                AIMessage(
+                    content="⚠️ This analysis is for educational purposes only and is not financial advice."
+                )
+            ]
+        }
+    return {}
+
+
+
 def node_clarify_preference(state):
     """
     Checks if the user has specified a visualization format.
@@ -401,7 +414,18 @@ def node_generate_viz(state):
             row_heights=[0.7, 0.3]
         )
 
-        fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Close Price', line=dict(color='blue')), row=1, col=1)
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["Close"],
+                mode="lines",
+                name="Close Price",
+                legendgroup="price",
+                line=dict(color="blue"),
+                showlegend=True
+            ),
+            row=1, col=1
+        )
 
         # --- NEW: ADD FORECAST TRACE ---
         forecast_data = state.get("forecast_data")
@@ -415,23 +439,50 @@ def node_generate_viz(state):
             f_dates.insert(0, df.index[-1].strftime('%Y-%m-%d'))
             f_prices.insert(0, df['Close'].iloc[-1])
             
-            fig.add_trace(go.Scatter(
-                x=f_dates, 
-                y=f_prices, 
-                mode='lines', 
-                name='7-Day Forecast', 
-                line=dict(color='green', dash='dot', width=2)
-            ))
+            if forecast_data:
+                fig.add_trace(
+                    go.Scatter(
+                        x=f_dates,
+                        y=f_prices,
+                        mode="lines",
+                        name="7-Day Forecast",
+                        legendgroup="forecast",
+                        line=dict(dash="dot", color="orange"),
+                        visible="legendonly"  # 👈 hidden by default
+                        
+                    ),
+                    row=1, col=1
+                )
+
         # 2. SMA (if exists)
-        if 'SMA_20' in df.columns:
-            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], mode='lines', name='SMA (20)', line=dict(color='orange', dash='dash')), row=1, col=1)
+        if "SMA_20" in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["SMA_20"],
+                    mode="lines",
+                    name="SMA 20",
+                    legendgroup="sma",
+                    line=dict(dash="dash", color="green"),
+                    visible=True
+                ),
+                row=1, col=1
+            )
 
         # 3. RSI (if exists)
-        if 'RSI' in df.columns:
-            fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], mode='lines', name='RSI', line=dict(color='purple')), row=2, col=1)
-            # Add Overbought/Oversold lines
-            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought")
-            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold")
+        if "RSI" in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["RSI"],
+                    mode="lines",
+                    name="RSI",
+                    line=dict(color="purple"),
+                    legendgroup="rsi",
+                    visible="legendonly"  # 👈 hidden by default
+                ),
+                row=2, col=1
+            )
 
         # Layout Polish
         fig.update_layout(
@@ -444,8 +495,10 @@ def node_generate_viz(state):
         # Save to HTML
         fig.write_html(filepath)
         print(f"--- [LOG] Interactive chart saved to {filepath}")
-
+        metadata = state.get("forecast_meta", {})
+        
         msg = f"I have generated the interactive chart for **{ticker}**. Saved at: `{filepath}`"
+        msg += f"\n\n**Forecast Info:** R² Score = {metadata.get('r2_score', 'N/A')}, Trend = {metadata.get('trend', 'N/A')}"
         return {"messages": [AIMessage(content=msg)], "output_preference": None, "stock_data": None}
     
     
@@ -549,9 +602,11 @@ def  node_forecast(state):
     
     # 3. Predict Future (Next 7 days)
     last_date = df.index[-1]
-    future_dates = [last_date + timedelta(days=i) for i in range(1, 8)]
+    future_dates = [last_date + timedelta(days=i) for i in range(1, 30)]
     future_ordinals = np.array([d.toordinal() for d in future_dates]).reshape(-1, 1)
-    
+    r2 = model.score(X, y)
+    print(f"--- [LOG] Regression R^2 Score: {r2:.4f}")
+    trend = "upward" if model.coef_[0] > 0 else "downward"
     predictions = model.predict(future_ordinals)
     
     # 4. Format for State
@@ -562,7 +617,7 @@ def  node_forecast(state):
     }
     
     print(f"--- [LOG] Generated forecast for next {len(forecast_dict)} days.")
-    return {"forecast_data": forecast_dict}
+    return {"forecast_data": forecast_dict,"forecast_meta" : {"r2_score": round(r2,4), "trend": trend}}
 
 
 from my_agent.utils.rag import query_rag
