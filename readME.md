@@ -1,207 +1,171 @@
+---
+title: Trader Companion AI
+emoji: 📈
+colorFrom: blue
+colorTo: green
+sdk: docker
+python_version: "3.11"
+app_file: app.py
+app_port: 7860
+fullWidth: true
+header: default
+short_description: Autonomous financial agent.
+tags:
+  - finance
+  - stocks
+  - technical-analysis
+  - RAG
+  - forecast
+  - agent
+  - langgraph
+  - ollama
+---
+
+
 # 📈 Trader Companion AI
 
-A toy but professional **AI-powered trading assistant** built with **LangGraph, LangChain, Streamlit, and Plotly**.
+![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
+![Streamlit](https://img.shields.io/badge/Frontend-Streamlit-red?logo=streamlit)
+![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange)
+![Ollama](https://img.shields.io/badge/AI-Ollama%20\(Local\)-black?logo=ollama)
+![Docker](https://img.shields.io/badge/Deployment-Docker-blue?logo=docker)
 
-Trader Companion AI lets you explore stocks, generate interactive technical charts, run basic forecasts, analyze sentiment, and query your own documents — all through a conversational interface.
+**Trader Companion AI** is an autonomous financial agent that combines real-time stock analysis with private document retrieval (RAG).
 
-> ⚠️ Educational project only. This tool does **not** provide financial advice.
-
----
-
-## ✨ Features Overview
-
-### 1. Conversational Stock Analysis
-
-Ask natural language questions such as:
-
-* "Analyze Amazon from 2024-01-01 to 2024-03-01"
-* "Show me Nvidia technicals"
-* "Plot Apple with RSI and forecast"
-
-The agent automatically:
-
-* Extracts tickers and dates
-* Validates symbols via Yahoo Finance
-* Fetches historical market data
+Unlike simple chatbots, this agent uses a **cyclic graph architecture** to self-correct errors. If it can't find a ticker (e.g., "Boralex"), it searches the web, verifies candidates against official listings, checks for name collisions, and validates data availability before answering.
 
 ---
 
-### 2. Interactive Technical Charts (Plotly)
+## 🧭 High-Level Flow (Agent Graph)
 
-The agent generates **interactive HTML charts** with:
+The diagram below illustrates how the agent routes intent, validates tickers, self-corrects failures, and produces analysis or RAG-based answers.
 
-* **Close Price**
-* **Simple Moving Average (SMA 20)**
-* **Relative Strength Index (RSI)**
-* **Linear Regression Forecast** (short-term)
+```mermaid
+graph TD
+    Start([User Input]) --> Extractor[Extract Entities]
+    Extractor --> Router{RAG or Web?}
+    
+    Router -- RAG Active --> RagSearch[Query Vector DB]
+    RagSearch -->|Success| End([Response])
+    RagSearch -->|Fallback| TickerCheck
+    
+    Router -- Web Mode --> TickerCheck[Validate Ticker]
+    
+    TickerCheck -->|Invalid| WebSearch[DuckDuckGo Search]
+    WebSearch --> TickerCheck
+    
+    TickerCheck -->|Valid| DateCheck[Validate Dates]
+    DateCheck --> Fetcher[Smart Data Fetcher]
+    
+    Fetcher -->|News Intent| Sentiment[Sentiment Analysis]
+    Fetcher -->|Data Intent| Analyst[Tech Analysis]
+    
+    Analyst --> Forecast[Linear Regression Forecast]
+    Forecast --> Viz[Generate Plotly Chart]
+    
+    Sentiment --> End
+    Viz --> End
 
-Chart characteristics:
-
-* One color per indicator
-* RSI and Forecast hidden by default (toggle via legend)
-* Shared time axis
-* Saved as standalone `.html` files
-
-#### Example Plot Layout
-
-* Top panel: Price, SMA, Forecast
-* Bottom panel: RSI
-
-```
-| Price + SMA + Forecast |
-|------------------------|
-| RSI Momentum           |
-```
-
----
-
-### 3. Technical Indicators
-
-The agent computes technical indicators automatically:
-
-* **RSI (14)** using `pandas-ta`
-* **SMA (20)**
-
-Indicators are added to both:
-
-* Interactive charts
-* Tabular output (when requested)
-
----
-
-### 4. Short-Term Forecasting
-
-A simple but transparent forecasting module:
-
-* Uses **Linear Regression** on the last 30 trading days
-* Predicts up to **30 future days**
-* Displays:
-
-  * Forecast curve
-  * R² score
-  * Trend direction (upward / downward)
-
-The forecast is:
-
-* Clearly separated from historical prices
-* Hidden by default
-* Labeled as educational
-
----
-
-### 5. Market Sentiment Analysis (News)
-
-When news is requested, the agent:
-
-1. Fetches recent financial news
-2. Runs LLM-based sentiment analysis
-3. Outputs:
-
-   * Sentiment score (-1 to +1)
-   * Verdict (Bullish / Neutral / Bearish)
-   * Short explanation
-
----
-
-### 6. Company Fundamentals
-
-For company-level questions, the agent can display:
-
-* Sector and industry
-* Market capitalization
-* P/E ratio
-* Business summary
-
-Data is retrieved live from Yahoo Finance.
-
----
-
-### 7. Document Search (RAG)
-
-Upload your own PDFs (earnings reports, strategy notes, research):
-
-* Automatic indexing
-* Vector-based retrieval
-* LLM answers strictly grounded in your documents
-
-The UI includes:
-
-* Sidebar upload
-* Progress indicator
-* Toggle to enable / disable RAG mode
-
-If RAG is off, the agent falls back to web-based financial data.
-
----
-
-### 8. Table Output Mode
-
-Instead of charts, you can ask for tabular data:
-
-* Recent closing prices
-* Volume
-* RSI and SMA (if available)
-
-Example:
-
-```
-| Date       | Close | Volume | RSI | SMA_20 |
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:1px
+    classDef decision fill:#ffefdb,stroke:#f6b26b,stroke-width:2px
+    classDef process fill:#e1f5fe,stroke:#0277bd,stroke-width:2px
+    classDef endNode fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    
+    class Router decision
+    class Extractor,RagSearch,TickerCheck,WebSearch,DateCheck,Fetcher,Sentiment,Analyst,Forecast,Viz process
+    class Start,End endNode
 ```
 
 ---
 
-## 🧠 Architecture
+## 🧠 System Architecture
 
-* **Frontend**: Streamlit
-* **Agent Orchestration**: LangGraph
-* **LLMs**: Ollama (Qwen 2.5)
-* **Market Data**: yFinance
-* **Charts**: Plotly
-* **Technical Analysis**: pandas-ta
-* **Forecasting**: scikit-learn
-* **RAG**: Vector database + embeddings
+The agent is powered by **LangGraph**, enabling non-linear workflows and state persistence. The system operates through a specialized node architecture:
+
+* **Router Logic:** Intelligently decides between pulling real-time market data, searching the web for news, or querying the internal Knowledge Base (PDFs) based on user intent.
+* **Self-Correction Loop:** If a stock ticker is invalid or ambiguous, the agent enters a fallback loop—searching the web, verifying exchange suffixes (e.g., converting `.TSX` to `.TO`), and validating against official company names before proceeding.
+* **Hybrid Search:** Combines DuckDuckGo for general queries and a local Vector Store (Ollama embeddings) for private document analysis.
 
 ---
 
-## 🚀 How to Run
+## ✨ Key Capabilities
+
+### 1. 🛡️ Robust Ticker Resolution
+
+* **Self-Correction:** Automatically maps informal names (e.g., "Ubisoft") to accurate tickers (`UBI.PA`) using a multi-step web search and validation loop.
+* **Collision Detection:** Uses fuzzy matching to distinguish between similar tickers (e.g., `BLX` for Boralex vs. Banco Latinoamericano).
+* **Suffix Handling:** Automatically converts exchange suffixes (e.g., `.TSX` → `.TO`) for API compatibility.
+
+### 2. 🧠 Smart Routing
+
+* Detects intent to route between **Fundamental Analysis**, **Technical Charts**, **News Sentiment**, or **Internal RAG** queries.
+* **Keyword Guards:** Bypasses LLM latency for direct data requests (e.g., "Show me the price of Apple").
+
+### 3. 📊 Interactive Visualization
+
+* Generates dynamic **Plotly** charts with zoom/pan.
+* Overlays **SMA (Simple Moving Average)** and **RSI (Relative Strength Index)**.
+* Projects a 7-day trend forecast using Linear Regression.
+
+### 4. 📚 Local RAG (Retrieval-Augmented Generation)
+
+* Ingests PDF reports into an in-memory Vector Store.
+* Uses **Ollama (nomic-embed-text)** for fully local, private document analysis.
+
+---
+
+## 🛠️ Installation & Setup
+
+### Option 1: Docker (Recommended)
 
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
+# Build the image
+docker build -t trader-ai .
+
+# Run the container (Exposes port 7860)
+docker run -p 7860:7860 trader-ai
 ```
 
-Make sure Ollama is running locally with the required model installed.
+### Option 2: Local Development
+
+Requires Python 3.11+ and [Ollama](https://ollama.com/) running locally.
+
+1. **Clone and Install**
+
+   ```bash
+   git clone https://github.com/yourusername/trader-companion.git
+   cd trader-companion
+   pip install -r requirements.txt
+   ```
+
+2. **Start Ollama**
+
+   ```bash
+   ollama pull qwen2.5:7b
+   ollama pull nomic-embed-text
+   ollama serve
+   ```
+
+3. **Run Streamlit**
+
+   ```bash
+   streamlit run app.py
+   ```
 
 ---
 
-## 🎯 What This Project Is
+## 🧪 Testing
 
-* A learning-oriented trading assistant
-* A clean LangGraph reference architecture
-* A sandbox for combining LLMs, charts, and financial data
+```bash
+# Run all tests
+pytest tests/test_agent.py
 
-## ❌ What This Project Is Not
-
-* A production trading system
-* A reliable forecasting engine
-* Financial advice
+# Run specific ticker validation tests
+pytest -k "validate_ticker"
+```
 
 ---
 
-## 📌 Next Ideas to Explore
+## ⚠️ Disclaimer
 
-* Trend-based coloring (bullish / bearish)
-* Support & resistance detection
-* Multi-indicator strategies
-* Backtesting engine
-* Portfolio-level analysis
-
----
-
-## 📄 License
-
-MIT — use, modify, and experiment freely.
-
----
-
-Happy experimenting 🚀
+*This project is for educational purposes only. The financial forecasts and analysis provided by the AI are based on simple statistical models and should not be used as financial advice.*

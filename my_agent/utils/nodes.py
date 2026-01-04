@@ -1,35 +1,52 @@
+import os
+import re
+import json
 import uuid
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
-from langchain_core.output_parsers import JsonOutputParser
-from matplotlib import pyplot as plt
-import numpy as np
-import pandas as pd
-from pydantic import BaseModel, Field
-from typing import Optional
+import difflib
 from datetime import datetime, timedelta
+from typing import Optional
+
+# --- DATA SCIENCE IMPORTS ---
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+import yfinance as yf
+from matplotlib import pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import os
 from sklearn.linear_model import LinearRegression
-import yfinance as yf
+
+# --- LANGCHAIN / AI IMPORTS ---
 from langchain_core.messages import AIMessage, HumanMessage
-import pandas_ta as ta
-# Ensure this import matches your project structure
-from my_agent.utils.tools import lookup_knowledge_base, search_financial_news, get_company_fundamentals
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_ollama import ChatOllama
+from langchain_community.tools import DuckDuckGoSearchRun
+from pydantic import BaseModel, Field
 
+# --- PROJECT IMPORTS ---
+from my_agent.utils.tools import (
+    lookup_knowledge_base, 
+    search_financial_news, 
+    get_company_fundamentals
+)
+from my_agent.utils.rag import query_rag
 
+# =============================================================================
+# 0. GLOBAL CONFIGURATION & MODELS
+# =============================================================================
 
+# Load S&P 500 Data for local lookup
 try:
     if os.path.exists("my_agent/sp500_tickers.csv"):
         SP500_DF = pd.read_csv("my_agent/sp500_tickers.csv")
     else:
-        # raise FileNotFoundError
         FileNotFoundError("sp500_tickers.csv not found.")
+        SP500_DF = pd.DataFrame(columns=['Symbol', 'Security'])
 except Exception as e:
     SP500_DF = pd.DataFrame(columns=['Symbol', 'Security'])
-    
-# 1. Define the Schema for the LLM to fill
+
+# Schema for Entity Extraction
 class SearchIntent(BaseModel):
     company_name: Optional[str] = Field(
         None, 
@@ -37,7 +54,7 @@ class SearchIntent(BaseModel):
     )
     start_date: Optional[str] = Field(
         None, 
-        description="The start date for the data in YYYY-MM-DD format. Calculate relative dates (e.g., 'last month') based on today."
+        description="The start date for the data in YYYY-MM-DD format. Calculate relative dates."
     )
     end_date: Optional[str] = Field(
         None, 
@@ -48,14 +65,16 @@ class SearchIntent(BaseModel):
         description="The preferred output format. Must be either 'plot' or 'table'."
     )
 
+# =============================================================================
+# 1. INPUT PROCESSING & VALIDATION NODES
+# =============================================================================
 
 def node_extract_entities(state):
     """
-    Analyzes the conversation history to extract search parameters.
+    Analyzes the conversation history to extract search parameters (Ticker, Date, Style).
     """
     print("\n--- [NODE] EXTRACT ENTITIES ---")
     
-    # Log the input messages
     messages = state.get("messages", [])
     if messages:
         print(f"--- [LOG] Last User Message: '{messages[-1].content}'")
@@ -112,54 +131,109 @@ def node_extract_entities(state):
         print(f"--- [ERROR] Extraction Error: {e}")
         return {}
 
-
-
-
 def node_validate_ticker(state):
     """
-    Verifies the ticker actually exists on Yahoo Finance.
+    Robust Ticker Validation Node.
+    1. Checks S&P 500 CSV (Fast Path).
+    2. Searches Web for multiple candidates (Slow Path).
+    3. Validates against Yahoo Finance data AND Company Name to avoid collisions.
     """
-    print("\n--- [NODE] VALIDATE TICKER ---")
+    print("\n--- [NODE] VALIDATE TICKER (FINAL ROBUST) ---")
     ticker_input = state.get("ticker")
-    print(f"--- [LOG] Input Ticker: {ticker_input}")
-
+    
     if not ticker_input:
-        print("--- [LOG] No ticker provided. Returning error.")
         return {"error_message": "No company name provided."}
 
-    resolved_ticker = ticker_input.strip().upper()
-    print(f"--- [LOG] Normalized Ticker: {resolved_ticker}")
-    
+    # --- STEP 1: CHECK LOCALLY (S&P 500 CSV) ---
     if not SP500_DF.empty:
         mask = (SP500_DF['Security'].str.contains(ticker_input, case=False, na=False) | 
                 SP500_DF['Symbol'].str.contains(ticker_input, case=False, na=False))
-        print(f"--- [LOG] Searching CSV for matches...")
-        print(SP500_DF[mask])
         match = SP500_DF[mask]
         if not match.empty:
-            resolved_ticker = match.iloc[0]['Symbol']
-            print(f"--- [LOG] Found in CSV Match: {resolved_ticker}")
+            found_ticker = match.iloc[0]['Symbol']
+            return {"ticker": found_ticker, "error_message": None}
 
+    # --- STEP 2: SEARCH WEB & RETRIEVE CANDIDATES ---
+    candidates = []
     try:
-        print(f"--- [LOG] verifying {resolved_ticker} with yfinance...")
-        stock = yf.Ticker(resolved_ticker)
-        history = stock.history(period="1d")
+        search = DuckDuckGoSearchRun()
+        query = f"Yahoo finance ticker symbol for {ticker_input}"
+        search_results = search.invoke(query)
         
-        if history.empty:
-            error_msg = f"I couldn't find a valid stock for '{ticker_input}'. Did you mean '{resolved_ticker}'?"
-            print(f"--- [LOG] Verification Failed. {error_msg}")
-            return {"ticker": None, "error_message": error_msg}
-            
-        print("--- [LOG] Ticker Validated Successfully.")
-    except Exception as e:
-        print(f"--- [ERROR] yfinance Verification Error: {e}")
-        return {"ticker": None, "error_message": f"Error validating ticker: {str(e)}"}
+        llm = ChatOllama(model="qwen2.5:7b", temperature=0)
+        extraction_prompt = f"""
+        Search Results: "{search_results}"
+        Task: Identify valid Yahoo Finance tickers for '{ticker_input}'.
+        Rules: Return up to 3 likely tickers, separated by commas.
+        """
+        response = llm.invoke(extraction_prompt)
+        raw_list = [c.strip() for c in response.content.split(',')]
+        for c in raw_list:
+            clean = re.sub(r'[^A-Z0-9\.-]', '', c.upper())
+            if clean and "NOTFOUND" not in clean:
+                candidates.append(clean)
+    except Exception:
+        pass
 
-    return {
-        "ticker": resolved_ticker, 
-        "error_message": None 
-    }
+    if not candidates:
+        candidates = [ticker_input.upper()]
+
+    # --- STEP 3: EXPAND CANDIDATES (Suffixes AND Roots) ---
+    expanded_candidates = []
+    for c in candidates:
+        if c not in expanded_candidates:
+            expanded_candidates.append(c)
+        
+        if "." not in c:
+            # If Root, try adding International Suffixes
+            for suffix in [".TO", ".PA", ".L", ".SW"]:
+                if f"{c}{suffix}" not in expanded_candidates:
+                    expanded_candidates.append(f"{c}{suffix}")
+        else:
+            # If Suffix exists, try the Root (e.g. STLA.PA -> STLA)
+            root = c.split('.')[0]
+            if root not in expanded_candidates:
+                expanded_candidates.append(root)
+
+    # --- STEP 4: VALIDATION LOOP ---
+    suffix_map = {".TSX": ".TO", ".TV": ".TO", ".PAR": ".PA", ".TYO": ".T", ".LSE": ".L", ".HKG": ".HK", ".ASX": ".AX"}
     
+    for cand in expanded_candidates:
+        # Auto-correct suffix
+        for bad, good in suffix_map.items():
+            if cand.endswith(bad):
+                cand = cand.replace(bad, good)
+        
+        try:
+            print(f"--- [LOG] Testing Candidate: '{cand}'...")
+            stock = yf.Ticker(cand)
+            hist = stock.history(period="1d")
+            
+            if hist.empty:
+                continue
+
+            # Check Name Similarity
+            info = stock.info
+            yahoo_name = info.get("longName", "").lower()
+            user_query = ticker_input.lower()
+            
+            is_match = False
+            if user_query in yahoo_name:
+                is_match = True
+            else:
+                ratio = difflib.SequenceMatcher(None, user_query, yahoo_name).ratio()
+                if cand.split('.')[0] == ticker_input.upper(): ratio += 0.3 
+                if ratio > 0.4: is_match = True
+            
+            if is_match:
+                print(f"--- [LOG] Match Confirmed! '{cand}' is '{yahoo_name}'")
+                return {"ticker": cand, "error_message": None}
+
+        except Exception:
+            continue
+
+    return {"ticker": None, "error_message": f"Could not verify ticker for '{ticker_input}'."}
+
 def node_validate_dates(state):
     """
     Validates start/end dates. 
@@ -168,17 +242,16 @@ def node_validate_dates(state):
     start_date_str = state.get("start_date")
     end_date_str = state.get("end_date")
     preference = state.get("output_preference")
-    print(f"--- [LOG] Checking Dates: Start={start_date_str}, End={end_date_str}")
     
     updates = {}
     error_msgs = []
     
     if not start_date_str and not end_date_str:
-        if preference :
-            return {"error_message": "Pleasae provide start and end dates."}
+        if preference:
+            return {"error_message": "Please provide start and end dates."}
         else:
-            print("--- [LOG] No dates provided. But chart no reqeusted. Passing trhough.")
             return {"error_message": None}
+            
     dt_start = None
     dt_end = None
     today = datetime.now()
@@ -210,45 +283,76 @@ def node_validate_dates(state):
             error_msgs.append("Start date cannot be after end date.")
 
     if error_msgs:
-        print(f"--- [LOG] Date Validation Errors: {error_msgs}")
         return {"error_message": " ".join(error_msgs)}
     
-    print("--- [LOG] Dates Validated Successfully.")
     updates["error_message"] = None
     return updates
+
+def node_clarify_preference(state):
+    """
+    Checks if the user has specified a visualization format (Plot vs Table).
+    """
+    print("\n--- [NODE] CLARIFY PREFERENCE ---")
+    preference = state.get("output_preference")
+    
+    if preference:
+        pref_clean = preference.lower().strip()
+        if pref_clean in ["plot", "chart", "graph", "drawing"]:
+            return {"output_preference": "plot", "error_message": None}
+        elif pref_clean in ["table", "list", "data", "rows", "csv"]:
+            return {"output_preference": "table", "error_message": None}
+
+    return {
+        "output_preference": None,
+        "error_message": "Would you like to see a plot or a table?"
+    }
+
+# =============================================================================
+# 2. DATA RETRIEVAL (ROUTER)
+# =============================================================================
+
 def node_fetch_data(state):
     """
-    Smart Router: Decides between News, Fundamentals, RAG (Internal Docs), or Stock Data.
+    Smart Router: Decides between News, Fundamentals, RAG, or Stock Data.
+    Prioritizes Stock Data if keywords like 'price', 'values', or 'chart' are detected.
     """
     print("\n--- [NODE] FETCH DATA (ROUTER) ---")
+    
     ticker = state.get("ticker")
     start_date = state.get("start_date")
     end_date = state.get("end_date")
     existing_preference = state.get("output_preference")
     
-    # If the user explicitly asked for a plot/table, we skip the router and go straight to data
-    if existing_preference in ["plot", "table"]:
-        print(f"--- [LOG] Preference '{existing_preference}' found. Defaulting to Data Fetch.")
+    messages = state.get("messages", [])
+    last_msg = messages[-1].content.lower() if messages else ""
+
+    # --- KEYWORD GUARD ---
+    data_keywords = ["price", "value", "values", "chart", "plot", "graph", "history", "trend", "data"]
+    
+    if existing_preference in ["plot", "table"] or any(k in last_msg for k in data_keywords):
+        print(f"--- [LOG] Data intent detected. Forcing Data Fetch.")
         should_fetch_data = True
     else:
-        print("--- [LOG] Preference unknown. Asking Router LLM...")
-        
-        # 1. Bind all available tools including the new RAG tool
+        print("--- [LOG] Intent unclear. Asking Router LLM...")
+        should_fetch_data = False
+
+    # --- LLM ROUTER ---
+    if not should_fetch_data:
         llm = ChatOllama(model="qwen2.5:7b", temperature=0)
         llm_with_tools = llm.bind_tools([
             search_financial_news, 
             get_company_fundamentals, 
             lookup_knowledge_base
-        ])    
+        ])      
         
-        last_msg = state['messages'][-1].content
-        
-        # Context string to help the LLM decide
         msg = (
             f"User Input: '{last_msg}'\n"
             f"Context: Ticker={ticker}, DateRange={start_date} to {end_date}.\n"
-            "Decide the best tool to use. If they ask about strategy/docs, use lookup_knowledge_base. "
-            "If they ask for price/chart/table, do not use a tool."
+            "Decide the best tool to use:\n"
+            "- Use 'lookup_knowledge_base' for strategy, PDFs, or internal docs.\n"
+            "- Use 'search_financial_news' for 'news', 'why', 'headlines'.\n"
+            "- Use 'get_company_fundamentals' for 'sector', 'industry', 'market cap'.\n"
+            "- IF the user asks for prices, values, history, or charts, DO NOT use a tool. Return empty."
         )
         
         response = llm_with_tools.invoke([HumanMessage(content=msg)])
@@ -259,29 +363,22 @@ def node_fetch_data(state):
             tool_args = tool_call["args"]
             print(f"--- [LOG] LLM Decided: USE TOOL '{tool_name}'")
             
-            # --- CASE A: RAG / KNOWLEDGE BASE ---
             if tool_name == "lookup_knowledge_base":
-                # We return a flag/key that the Graph Edges will use to route to 'node_rag_search'
-                # Note: You must update your conditional edges in the main graph file to look for 'is_rag_query'
                 return {
                     "is_rag_query": True,
                     "messages": [AIMessage(content="Checking internal knowledge base...")]
                 }
 
-            # --- CASE B: NEWS ---
             elif tool_name == "search_financial_news":
-                print(f"--- [LOG] Invoking News Tool with: {tool_args}")
-                tool_result = search_financial_news.invoke(tool_args)
+                # Force ticker into the search (Safe Query)
+                tool_result = search_financial_news.invoke(ticker)
                 return {
                     "news_summary": tool_result, 
-                    "messages": [AIMessage(content=f"Searching news for {ticker}...")]
+                    "messages": [AIMessage(content=f"Fetching latest headlines for **{ticker}**...")]
                 }
 
-            # --- CASE C: FUNDAMENTALS ---
             elif tool_name == "get_company_fundamentals":
-                print(f"--- [LOG] Invoking Fundamentals Tool with: {tool_args}")
                 tool_result = get_company_fundamentals.invoke(tool_args)
-                
                 content = (
                     f"### 🏢 {tool_result.get('name', 'Company')}\n"
                     f"**Sector:** {tool_result.get('sector', 'N/A')} | **Industry:** {tool_result.get('industry', 'N/A')}\n"
@@ -292,16 +389,12 @@ def node_fetch_data(state):
                     "messages": [AIMessage(content=content)],
                     "error_message": None
                 }
-                
         else:
-            # No tool selected -> Default to Data Fetching (Prices/Volume)
-            print(f"--- [LOG] LLM Decided: FETCH STOCK DATA.")
             should_fetch_data = True
 
-    # --- DEFAULT PATH: STOCK DATA FETCHING ---
+    # --- STOCK DATA FETCHING ---
     if should_fetch_data:
         if not ticker or not start_date or not end_date:
-            print("--- [LOG] Missing parameters for data fetch.")
             return {"error_message": "Missing ticker or date range for data fetch."}
         
         try:
@@ -315,67 +408,190 @@ def node_fetch_data(state):
             hist.index = hist.index.strftime('%Y-%m-%d')
             data_serializable = hist.to_dict(orient="index")
             
-            return {
+            updates = {
                 "stock_data": data_serializable,
                 "error_message": None
             }
+            if not existing_preference:
+                updates["output_preference"] = "plot"
+            return updates
             
         except Exception as e:
             return {"error_message": f"Error fetching data: {str(e)}"}
-
-def node_risk_disclaimer(state):
-    if state.get("signals") or state.get("forecast_data"):
-        return {
-            "messages": state.get("messages", []) + [
-                AIMessage(
-                    content="⚠️ This analysis is for educational purposes only and is not financial advice."
-                )
-            ]
-        }
+            
     return {}
 
+# =============================================================================
+# 3. ANALYSIS & LOGIC NODES
+# =============================================================================
 
-
-def node_clarify_preference(state):
+def node_technical_analysis(state):
     """
-    Checks if the user has specified a visualization format.
+    Calculates RSI and SMA indicators.
     """
-    print("\n--- [NODE] CLARIFY PREFERENCE ---")
-    preference = state.get("output_preference")
-    print(f"--- [LOG] Current Preference: {preference}")
+    print("\n--- [NODE] TECHNICAL ANALYSIS ---")
+    stock_data = state.get("stock_data")
+    ticker = state.get("ticker", "Stock")
     
-    if preference:
-        pref_clean = preference.lower().strip()
-        if pref_clean in ["plot", "chart", "graph", "drawing"]:
-            print("--- [LOG] Standardized to 'plot'")
-            return {"output_preference": "plot", "error_message": None}
-        elif pref_clean in ["table", "list", "data", "rows", "csv"]:
-            print("--- [LOG] Standardized to 'table'")
-            return {"output_preference": "table", "error_message": None}
-
-    print("--- [LOG] Preference unclear. Setting error message to ask user.")
+    if not stock_data:
+        return {"messages": [AIMessage(content="No stock data available for technical analysis.")]}
+    
+    df = pd.DataFrame.from_dict(stock_data, orient="index")
+    df.index = pd.to_datetime(df.index)
+    
+    # Calculate Indicators
+    df['RSI'] = ta.rsi(df['Close'], length=14)
+    df['SMA_20'] = ta.sma(df['Close'], length=20)
+    df = df.fillna(0)
+    df.index = df.index.strftime('%Y-%m-%d')
+    
     return {
-        "output_preference": None,
-        "error_message": "Would you like to see a plot or a table?"
+        "stock_data": df.to_dict(orient="index"),
+        "messages": [AIMessage(content=f"Technical analysis for **{ticker}** completed.")]
+    }
+    
+def node_sentiment_analysis(state):
+    """
+    Analyzes news summary using LLM.
+    """
+    print("\n--- [NODE] SENTIMENT ANALYSIS ---")
+    news_text = state.get("news_summary")
+    if not news_text:
+        return {}
+
+    llm = ChatOllama(model="qwen2.5:7b", temperature=0, format="json")
+    
+    system = """You are a veteran financial analyst. 
+    Analyze the following news summary and determine the market sentiment.
+    Return a JSON with: "score" (-1.0 to 1.0), "verdict", "explanation".
+    """
+    msg = f"News Summary: {news_text}"
+    
+    try:
+        response = llm.invoke([("system", system), ("human", msg)])
+        analysis = json.loads(response.content)
+        
+        formatted_msg = (
+            f"**Sentiment Verdict:** {analysis['verdict']} (Score: {analysis['score']})\n\n"
+            f"_{analysis['explanation']}_\n\n"
+            f"---\n**News Source:**\n{news_text[:500]}..."
+        )
+        return {
+            "sentiment": analysis,
+            "messages": [AIMessage(content=formatted_msg)],
+            "news_summary": None 
+        }
+    except Exception as e:
+        return {"error_message": f"Sentiment analysis failed: {e}"}
+    
+def node_forecast(state):
+    """
+    Linear Regression Forecast for next 30 days.
+    """
+    print("\n--- [NODE] FORECASTING ---")
+    stock_data = state.get("stock_data")
+    if not stock_data:
+        return {}
+    
+    df = pd.DataFrame.from_dict(stock_data, orient="index")
+    df.index = pd.to_datetime(df.index)
+    
+    # Feature Engineering
+    df['Date_Ordinal'] = df.index.map(pd.Timestamp.toordinal)
+    recent_df = df.tail(30)
+    X = recent_df[['Date_Ordinal']].values
+    y = recent_df['Close'].values
+    
+    # Model Fit
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # Predict
+    last_date = df.index[-1]
+    future_dates = [last_date + timedelta(days=i) for i in range(1, 30)]
+    future_ordinals = np.array([d.toordinal() for d in future_dates]).reshape(-1, 1)
+    
+    predictions = model.predict(future_ordinals)
+    r2 = model.score(X, y)
+    trend = "upward" if model.coef_[0] > 0 else "downward"
+    
+    forecast_dict = {
+        date.strftime('%Y-%m-%d'): float(pred)
+        for date, pred in zip(future_dates, predictions)
+    }
+    
+    print(f"--- [LOG] R^2: {r2:.4f}, Trend: {trend}")
+    return {"forecast_data": forecast_dict, "forecast_meta" : {"r2_score": round(r2,4), "trend": trend}}
+
+def node_company_profile(state):
+    """
+    Extracts profile info from stock data.
+    """
+    print("--- [NODE] COMPANY PROFILE ---")
+    stock_data = state.get("stock_data")
+    ticker = state.get("ticker")
+    
+    if not stock_data or "info" not in stock_data:
+        return {} 
+        
+    info = stock_data["info"]
+    name = info.get("longName", ticker)
+    mkt_cap = info.get("marketCap", 0)
+    mkt_cap_str = f"${mkt_cap / 1e9:.2f}B" if mkt_cap else "N/A"
+    
+    profile_text = (
+        f"### 🏢 {name}\n"
+        f"**Sector:** {info.get('sector', 'Unknown')} | **Market Cap:** {mkt_cap_str}\n\n"
+        f"_{info.get('longBusinessSummary', 'No summary')[:400]}..._"
+    )
+    return {"messages": [AIMessage(content=profile_text)]}
+
+# =============================================================================
+# 4. RAG SEARCH NODE
+# =============================================================================
+
+def node_rag_search(state):
+    """
+    Queries vector DB. Sets fallback flag if not found.
+    """
+    print("\n--- [NODE] RAG SEARCH ---")
+    messages = state.get("messages")
+    user_query = messages[-1].content
+    
+    context = query_rag(user_query)
+    
+    if not context:
+        print("--- [RAG] No context found. Fallback. ---")
+        return {"rag_fallback": True}
+
+    llm = ChatOllama(model="qwen2.5:7b", temperature=0)
+    system_prompt = """You are a documentation expert. Answer STRICTLY based on Context.
+    If answer is not in context, output: "NOT_FOUND"
+    Context: {context}
+    """
+    
+    msg = f"Question: {user_query}"
+    response = llm.invoke([("system", system_prompt.format(context=context)), ("human", msg)])
+    
+    if "NOT_FOUND" in response.content:
+        print("--- [RAG] LLM could not answer. Fallback. ---")
+        return {"rag_fallback": True}
+
+    return {
+        "messages": [AIMessage(content=response.content)],
+        "rag_fallback": False,
+        "error_message": None
     }
 
-def node_ask_user(state):
-    """
-    Formats the error/question as an AI Message.
-    """
-    print("\n--- [NODE] ASK USER ---")
-    message_text = state.get("error_message")
-    print(f"--- [LOG] Asking User: '{message_text}'")
-    
-    if not message_text:
-        message_text = "I'm not sure how to proceed. Could you provide more details?"
-
-    return {
-        "messages": [AIMessage(content=message_text)],
-    }
+# =============================================================================
+# 5. VISUALIZATION & UI NODES
+# =============================================================================
 
 def node_generate_viz(state):
-    print("\n--- [NODE] GENERATE VIZ (INTERACTIVE) ---")
+    """
+    Generates Plotly Charts or Markdown Tables.
+    """
+    print("\n--- [NODE] GENERATE VIZ ---")
     stock_data = state.get("stock_data")
     preference = state.get("output_preference")
     ticker = state.get("ticker", "Stock")
@@ -388,333 +604,63 @@ def node_generate_viz(state):
 
     # --- TABLE MODE ---
     if preference == "table":
-        cols_to_show = ['Close', 'Volume']
-        if 'RSI' in df.columns: cols_to_show.append('RSI')
-        if 'SMA_20' in df.columns: cols_to_show.append('SMA_20')
-        
-        table_md = df[cols_to_show].tail(10).to_markdown()
-        msg = f"Here is the recent market data for **{ticker}**:\n\n{table_md}"
+        cols = ['Close', 'Volume']
+        if 'RSI' in df.columns: cols.append('RSI')
+        table_md = df[cols].tail(10).to_markdown()
+        msg = f"Here is the recent data for **{ticker}**:\n\n{table_md}"
         return {"messages": [AIMessage(content=msg)], "output_preference": None, "stock_data": None}
 
-    # --- PLOT MODE (INTERACTIVE) ---
+    # --- PLOT MODE ---
     else:
         output_dir = "charts"
         os.makedirs(output_dir, exist_ok=True)
-        
-        # NOTE: We save as .html now, not .png
         filename = f"{ticker}_{uuid.uuid4().hex[:8]}.html"
         filepath = os.path.join(output_dir, filename)
 
-        # Create Subplots (Row 1 = Price, Row 2 = RSI)
         fig = make_subplots(
-            rows=2, cols=1, 
-            shared_xaxes=True, 
-            vertical_spacing=0.1, 
-            subplot_titles=(f"{ticker} Price Trend", "RSI Momentum"),
-            row_heights=[0.7, 0.3]
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
+            subplot_titles=(f"{ticker} Price Trend", "RSI Momentum"), row_heights=[0.7, 0.3]
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df["Close"],
-                mode="lines",
-                name="Close Price",
-                legendgroup="price",
-                line=dict(color="blue"),
-                showlegend=True
-            ),
-            row=1, col=1
-        )
+        # Price Trace
+        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Close", line=dict(color="blue")), row=1, col=1)
 
-        # --- NEW: ADD FORECAST TRACE ---
+        # Forecast Trace
         forecast_data = state.get("forecast_data")
         if forecast_data:
-            # Convert dict to lists
             f_dates = list(forecast_data.keys())
             f_prices = list(forecast_data.values())
-            
-            # Add a "connector" line from the last real price to the first predicted price
-            # This makes the line look continuous
+            # Connector
             f_dates.insert(0, df.index[-1].strftime('%Y-%m-%d'))
             f_prices.insert(0, df['Close'].iloc[-1])
             
-            if forecast_data:
-                fig.add_trace(
-                    go.Scatter(
-                        x=f_dates,
-                        y=f_prices,
-                        mode="lines",
-                        name="7-Day Forecast",
-                        legendgroup="forecast",
-                        line=dict(dash="dot", color="orange"),
-                        visible="legendonly"  # 👈 hidden by default
-                        
-                    ),
-                    row=1, col=1
-                )
+            fig.add_trace(go.Scatter(
+                x=f_dates, y=f_prices, mode="lines", name="Forecast", 
+                line=dict(dash="dot", color="orange"), visible="legendonly"
+            ), row=1, col=1)
 
-        # 2. SMA (if exists)
+        # Indicators
         if "SMA_20" in df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=df["SMA_20"],
-                    mode="lines",
-                    name="SMA 20",
-                    legendgroup="sma",
-                    line=dict(dash="dash", color="green"),
-                    visible=True
-                ),
-                row=1, col=1
-            )
-
-        # 3. RSI (if exists)
+            fig.add_trace(go.Scatter(x=df.index, y=df["SMA_20"], name="SMA 20", line=dict(dash="dash", color="green")), row=1, col=1)
         if "RSI" in df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=df["RSI"],
-                    mode="lines",
-                    name="RSI",
-                    line=dict(color="purple"),
-                    legendgroup="rsi",
-                    visible="legendonly"  # 👈 hidden by default
-                ),
-                row=2, col=1
-            )
+            fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="purple"), visible="legendonly"), row=2, col=1)
 
-        # Layout Polish
-        fig.update_layout(
-            height=800, 
-            title_text=f"{ticker} Technical Analysis", 
-            showlegend=True,
-            xaxis_rangeslider_visible=False # Hide the bottom slider to save space
-        )
-        
-        # Save to HTML
+        fig.update_layout(height=800, title_text=f"{ticker} Technical Analysis", xaxis_rangeslider_visible=False)
         fig.write_html(filepath)
-        print(f"--- [LOG] Interactive chart saved to {filepath}")
-        metadata = state.get("forecast_meta", {})
         
-        msg = f"I have generated the interactive chart for **{ticker}**. Saved at: `{filepath}`"
-        msg += f"\n\n**Forecast Info:** R² Score = {metadata.get('r2_score', 'N/A')}, Trend = {metadata.get('trend', 'N/A')}"
+        meta = state.get("forecast_meta", {})
+        msg = f"I have generated the chart for **{ticker}**. Saved at: `{filepath}`\n\n**Forecast Info:** R²={meta.get('r2_score')}, Trend={meta.get('trend')}"
+        
         return {"messages": [AIMessage(content=msg)], "output_preference": None, "stock_data": None}
-    
-    
-def node_technical_analysis(state):
-    """
-    Analyzes stock data for technical indicators (Placeholder), like RSI and SMA.
-    """
-    print("\n--- [NODE] TECHNICAL ANALYSIS ---")
-    stock_data = state.get("stock_data")
-    ticker = state.get("ticker", "Stock")
-    
-    if not stock_data:
-        print("--- [LOG] No stock data found in state for analysis.")
-        return {"messages": [AIMessage(content="No stock data available for technical analysis.")]}
-    
-    df = pd.DataFrame.from_dict(stock_data, orient="index")
-    df.index = pd.to_datetime(df.index)
-    
-    # Placeholder for actual technical analysis logic
-    df['RSI'] = ta.rsi(df['Close'], length=14)
-    df['SMA_20'] = ta.sma(df['Close'], length=20)
-    
-    df = df.fillna(0)
-    
-    df.index = df.index.strftime('%Y-%m-%d')
-    
-    print("--- [LOG] Technical analysis completed.")
-    return {
-        "stock_data": df.to_dict(orient="index"),
-        "messages": [AIMessage(content=f"Technical analysis for **{ticker}** completed.")]
-    }
-    
-def node_sentiment_analysis(state):
-    print("\n--- [NODE] SENTIMENT ANALYSIS ---")
-    news_text = state.get("news_summary")
-    if not news_text:
-        print("--- [LOG] No news summary found in state for sentiment analysis.")
-        return {}
 
-    # 1. Initialize LLM (Force JSON output)
-    llm = ChatOllama(model="qwen2.5:7b", temperature=0, format="json")
-    
-    # 2. Prompt
-    system = """You are a veteran financial analyst. 
-    Analyze the following news summary and determine the market sentiment.
-    Return a JSON with:
-    - "score": A float from -1.0 (Very Bearish) to 1.0 (Very Bullish).
-    - "verdict": A short string (e.g., "Bullish", "Neutral", "Bearish").
-    - "explanation": A 1-sentence explanation of why.
-    """
-    
-    msg = f"News Summary: {news_text}"
-    
-    # 3. Invoke
-    # (We use a simple invoke here since we just want a raw JSON string to parse)
-    # Ideally, reuse your JsonOutputParser pattern, but for brevity:
-    try:
-        response = llm.invoke([
-            ("system", system),
-            ("human", msg)
-        ])
-        import json
-        analysis = json.loads(response.content)
-        
-        # Format a nice message for the user
-        formatted_msg = (
-            f"**Sentiment Verdict:** {analysis['verdict']} (Score: {analysis['score']})\n\n"
-            f"_{analysis['explanation']}_\n\n"
-            f"---\n**News Source:**\n{news_text[:500]}..." # Truncate raw news
-        )
-        print("--- [LOG] Sentiment analysis completed.")
-        return {
-            "sentiment": analysis,
-            "messages": [AIMessage(content=formatted_msg)],
-            "news_summary": None # Clear raw news to save memory
-        }
-    except Exception as e:
-        return {"error_message": f"Sentiment analysis failed: {e}"}
-    
-def  node_forecast(state):
-    print("\n--- [NODE] FORECASTING ---")
-    stock_data = state.get("stock_data")
-    if not stock_data:
-        return {}
-    
-    # 1. Prepare Data
-    df = pd.DataFrame.from_dict(stock_data, orient="index")
-    df.index = pd.to_datetime(df.index)
-    
-    # Use ordinal dates for regression (math needs numbers, not date objects)
-    df['Date_Ordinal'] = df.index.map(pd.Timestamp.toordinal)
-    
-    # Train on the last 30 days only (for short-term trend relevance)
-    recent_df = df.tail(30)
-    X = recent_df[['Date_Ordinal']].values
-    y = recent_df['Close'].values
-    
-    # 2. Fit Model (Simple Linear Regression)
-    model = LinearRegression()
-    model.fit(X, y)
-    
-    # 3. Predict Future (Next 7 days)
-    last_date = df.index[-1]
-    future_dates = [last_date + timedelta(days=i) for i in range(1, 30)]
-    future_ordinals = np.array([d.toordinal() for d in future_dates]).reshape(-1, 1)
-    r2 = model.score(X, y)
-    print(f"--- [LOG] Regression R^2 Score: {r2:.4f}")
-    trend = "upward" if model.coef_[0] > 0 else "downward"
-    predictions = model.predict(future_ordinals)
-    
-    # 4. Format for State
-    # We store forecast as a separate dict to keep 'stock_data' clean
-    forecast_dict = {
-        date.strftime('%Y-%m-%d'): float(pred)
-        for date, pred in zip(future_dates, predictions)
-    }
-    
-    print(f"--- [LOG] Generated forecast for next {len(forecast_dict)} days.")
-    return {"forecast_data": forecast_dict,"forecast_meta" : {"r2_score": round(r2,4), "trend": trend}}
+def node_ask_user(state):
+    """Returns error message to user."""
+    print("\n--- [NODE] ASK USER ---")
+    msg = state.get("error_message") or "I'm not sure how to proceed."
+    return {"messages": [AIMessage(content=msg)]}
 
-
-from my_agent.utils.rag import query_rag
-
-def node_rag_search(state):
-    """
-    Queries the vector database for internal context.
-    If context is found, answers the user.
-    If not, sets a flag to fall back to web search.
-    """
-    print("\n--- [NODE] RAG SEARCH ---")
-    messages = state.get("messages")
-    # We use the last message as the query
-    user_query = messages[-1].content
-    
-    # 1. Retrieve Context
-    print(f"--- [LOG] Querying RAG with: {user_query}")
-    context = query_rag(user_query)
-    
-    # CASE A: No relevant text chunks found in DB
-    if not context:
-        print("--- [RAG] No context found. Falling back to Web. ---")
-        return {"rag_fallback": True} # The graph should catch this and route to Web Search
-
-    # 2. Synthesize Answer
-    llm = ChatOllama(model="qwen2.5:7b", temperature=0)
-    
-    # We tell the LLM to output a specific token if it doesn't know
-    system_prompt = """You are a documentation expert for this trading agent. 
-    Answer the user's question STRICTLY based on the provided Context chunks below.
-    
-    If the answer is NOT in the context, output exactly: "NOT_FOUND"
-    
-    Context:
-    {context}
-    """
-    
-    msg = f"Question: {user_query}"
-    
-    print("--- [LOG] Synthesizing RAG Answer...")
-    response = llm.invoke([("system", system_prompt.format(context=context)), ("human", msg)])
-    
-    # CASE B: Context found, but LLM says it's irrelevant
-    if "NOT_FOUND" in response.content:
-        print("--- [RAG] LLM could not answer based on context. Falling back to Web. ---")
-        return {"rag_fallback": True}
-    print("--- [RAG] LLM provided an answer based on context. ---")
-    # CASE C: Success
-    return {
-        "messages": [AIMessage(content=response.content)],
-        "rag_fallback": False,
-        "error_message": None
-    }
-    
-
-def node_company_profile(state):
-    print("--- [NODE] COMPANY PROFILE ---")
-    
-    # 1. Get the data from state
-    stock_data = state.get("stock_data")
-    ticker = state.get("ticker")
-    
-    # Safety Check: If no info was found, skip silently
-    if not stock_data or "info" not in stock_data:
-        return {} 
-        
-    info = stock_data["info"]
-    
-    # 2. Extract & Format Fields
-    name = info.get("longName", ticker)
-    sector = info.get("sector", "Unknown")
-    industry = info.get("industry", "Unknown")
-    
-    # Handle Summary (Truncate if too long)
-    summary = info.get("longBusinessSummary", "No summary available.")
-    if len(summary) > 400:
-        summary = summary[:400] + "..."
-        
-    # Handle Financials (Convert to Billions)
-    mkt_cap = info.get("marketCap", 0)
-    if mkt_cap:
-        mkt_cap_str = f"${mkt_cap / 1e9:.2f}B"
-    else:
-        mkt_cap_str = "N/A"
-        
-    pe_ratio = info.get("trailingPE", "N/A")
-    if isinstance(pe_ratio, float):
-        pe_ratio = f"{pe_ratio:.2f}"
-    
-    # 3. Create the Markdown Message
-    profile_text = (
-        f"### 🏢 {name}\n"
-        f"**Sector:** {sector} | **Industry:** {industry} | **Market Cap:** {mkt_cap_str} | **P/E:** {pe_ratio}\n\n"
-        f"_{summary}_"
-    )
-    
-    # 4. Return as a separate message
-    return {"messages": [AIMessage(content=profile_text)]}
-
-
+def node_risk_disclaimer(state):
+    """Appends disclaimer if analysis performed."""
+    if state.get("stock_data") or state.get("forecast_data"):
+        return {"messages": state.get("messages", []) + [AIMessage(content="⚠️ This analysis is for educational purposes only.")]}
+    return {}

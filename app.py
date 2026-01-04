@@ -1,161 +1,168 @@
-import streamlit as st
-import streamlit.components.v1 as components
-import uuid
 import os
 import re
+import uuid
+import streamlit as st
+import streamlit.components.v1 as components
 from langchain_core.messages import HumanMessage
 
-# --- IMPORTS FOR YOUR CUSTOM AGENT ---
+# --- CUSTOM AGENT IMPORTS ---
+# Ensure these match your project structure
 from my_agent.agent import app
 from my_agent.utils.rag import ingest_pdf
 
-# --- PAGE CONFIGURATION ---
+# =============================================================================
+# 1. CONFIG & UTILS
+# =============================================================================
+
 st.set_page_config(
     page_title="Trader Companion AI",
     page_icon="📈",
     layout="wide" 
 )
 
-st.title("📈 Trader Companion AI")
-st.caption("Interactive Technical Analysis & Document Search powered by LangGraph.")
+def initialize_session():
+    """Initializes Streamlit session state variables."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = str(uuid.uuid4())
+    
+    if "rag_capable" not in st.session_state:
+        st.session_state.rag_capable = False
 
-# --- SESSION STATE SETUP ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
-
-# Tracks if a file has EVER been uploaded in this session
-if "rag_capable" not in st.session_state:
-    st.session_state.rag_capable = False
-
-# --- HELPER: DETECT CHART PATH ---
 def extract_chart_path(content: str):
     """
-    Checks if the bot response contains a file path to an HTML chart.
+    Regex to find chart file paths in bot response.
+    Supports dots/hyphens in filenames (e.g., 'charts/UBI.PA_123.html').
     """
-    match = re.search(r"(charts/[a-zA-Z0-9_]+\.html)", content)
+    match = re.search(r"(charts/[\w\.-]+\.html)", content)
     if match:
         return match.group(1)
     return None
 
-# --- SIDEBAR: KNOWLEDGE BASE (RAG) ---
-st.sidebar.title("📚 Knowledge Base")
-uploaded_file = st.sidebar.file_uploader("Upload Company Report (PDF)", type="pdf")
-
-if uploaded_file:
-    # Save to disk temporarily
+def save_uploaded_file(uploaded_file):
+    """Saves uploaded PDF to a temporary file."""
     temp_path = "temp_doc.pdf"
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
+    return temp_path
+
+# =============================================================================
+# 2. UI COMPONENTS
+# =============================================================================
+
+def render_sidebar():
+    """Renders the Knowledge Base sidebar and handles PDF ingestion."""
+    st.sidebar.title("📚 Knowledge Base")
     
-    # --- PROGRESS BAR LOGIC ---
-    progress_bar = st.sidebar.progress(0)
-    status_text = st.sidebar.empty()
+    # 1. File Uploader
+    uploaded_file = st.sidebar.file_uploader("Upload Company Report (PDF)", type="pdf")
     
-    try:
-        # Loop through the generator to update the bar
-        for progress in ingest_pdf(temp_path):
-            progress_bar.progress(progress)
-            status_text.text(f"Indexing... {int(progress * 100)}%")
+    if uploaded_file:
+        temp_path = save_uploaded_file(uploaded_file)
+        
+        # Progress Bar Logic
+        progress_bar = st.sidebar.progress(0)
+        status_text = st.sidebar.empty()
+        
+        try:
+            for progress in ingest_pdf(temp_path):
+                progress_bar.progress(progress)
+                status_text.text(f"Indexing... {int(progress * 100)}%")
+                
+            status_text.empty()
+            st.sidebar.success("✅ Indexing Complete!")
             
-        status_text.empty() # Clear text
-        st.sidebar.success("✅ Indexing Complete!")
-        
-        # 1. Mark system as "Capable" of RAG
-        st.session_state.rag_capable = True
-        
-        # 2. Force the Toggle Switch to ON (if it exists in state)
-        # This makes the UI intuitive: Upload -> Auto-Enable
-        st.session_state["rag_toggle"] = True
-        
-    except Exception as e:
-        st.sidebar.error(f"Indexing failed: {e}")
+            # Auto-enable RAG
+            st.session_state.rag_capable = True
+            st.session_state["rag_toggle"] = True
+            
+        except Exception as e:
+            st.sidebar.error(f"Indexing failed: {e}")
 
-# --- MANUAL TOGGLE (THE MASTER SWITCH) ---
-# We link this widget to 'rag_toggle' key so we can control it from the upload block above
-use_rag = st.sidebar.toggle(
-    "🟢 Enable Document Search", 
-    key="rag_toggle", 
-    disabled=not st.session_state.rag_capable, # Grey out if no file
-    help="If On, bot reads your PDF. If Off, bot searches Yahoo Finance."
-)
-
-# --- VISUAL STATUS INDICATOR ---
-# This now looks at the SWITCH (use_rag), not the file upload status.
-if use_rag:
-    st.sidebar.info("🟢 RAG Mode Active: Analyzing PDF")
-else:
-    st.sidebar.info("⚪ Web Mode Active: Searching Yahoo Finance")
-
-
-# --- UI: DISPLAY CHAT HISTORY ---
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        # 1. Handle HTML Charts (Interactive)
-        if message.get("is_html"):
-            if os.path.exists(message["content"]):
-                with open(message["content"], 'r', encoding='utf-8') as f:
-                    html_content = f.read()
-                components.html(html_content, height=600, scrolling=True)
-            else:
-                st.error(f"Chart file missing: {message['content']}")
-        
-        # 2. Handle Text
-        else:
-            st.markdown(message["content"])
-
-# --- UI: CHAT INPUT ---
-if prompt := st.chat_input("Ask about a stock (e.g., 'Analyze Nvidia') or your PDF..."):
+    # 2. Master Toggle Switch
+    use_rag = st.sidebar.toggle(
+        "🟢 Enable Document Search", 
+        key="rag_toggle", 
+        disabled=not st.session_state.rag_capable,
+        help="ON: Reads PDF. OFF: Searches Web/Yahoo."
+    )
     
-    # User Message
+    # 3. Status Indicator
+    if use_rag:
+        st.sidebar.info("🟢 RAG Mode Active: Analyzing PDF")
+    else:
+        st.sidebar.info("⚪ Web Mode Active: Searching Yahoo Finance")
+        
+    return use_rag
+
+def render_chat_history():
+    """Displays existing chat messages and interactive charts."""
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            if message.get("is_html"):
+                # Render HTML Chart
+                if os.path.exists(message["content"]):
+                    with open(message["content"], 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    components.html(html_content, height=600, scrolling=True)
+                else:
+                    st.error(f"Chart file missing: {message['content']}")
+            else:
+                # Render Markdown Text
+                st.markdown(message["content"])
+
+# =============================================================================
+# 3. CORE LOGIC
+# =============================================================================
+
+def handle_user_input(prompt, use_rag):
+    """Processing loop for user input -> LangGraph -> UI Update."""
+    
+    # 1. Display User Message
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # Agent Response
+    # 2. Generate Agent Response
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("🕵️ *Thinking...*")
+        placeholder = st.empty()
+        placeholder.markdown("🕵️ *Thinking...*")
         
         try:
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
-            
-            # --- CRITICAL: PASS THE TOGGLE VALUE ---
             inputs = {
                 "messages": [HumanMessage(content=prompt)],
-                "is_rag_active": use_rag  # <--- True if Toggle is On, False if Off
+                "is_rag_active": use_rag
             }
             
-            # Run the Graph
+            # Invoke Graph
             final_state = app.invoke(inputs, config=config)
-            bot_response_content = final_state["messages"][-1].content
-            # Check for Chart
+            
+            # Extract response details
+            raw_response = final_state["messages"][-1].content
             chart_path = None
-            for msg in final_state["messages"]:
-                if isinstance(msg, dict):
-                    content = msg.get("content", "")
-                else:
-                    content = msg.content
-
+            
+            # Scan all recent messages for chart paths (handling multi-message outputs)
+            for msg in final_state["messages"][::-1]: # Look backwards
+                content = msg.content if hasattr(msg, "content") else msg.get("content")
                 path = extract_chart_path(content)
                 if path:
                     chart_path = path
                     break
 
+            # 3. Render Output
             if chart_path:
-                # === RENDER CHART ===
-                message_placeholder.empty() # Clear loading text
+                placeholder.empty() # Remove loading text
                 
+                # Render Chart
                 if os.path.exists(chart_path):
                     with open(chart_path, 'r', encoding='utf-8') as f:
                         html_content = f.read()
-                    
-                    # Render the interactive Plotly HTML
                     components.html(html_content, height=600, scrolling=True)
                     
-                    # Save to history with 'is_html' flag
+                    # Save Chart to History
                     st.session_state.messages.append({
                         "role": "assistant", 
                         "content": chart_path,
@@ -163,24 +170,45 @@ if prompt := st.chat_input("Ask about a stock (e.g., 'Analyze Nvidia') or your P
                     })
                 else:
                     st.error(f"File not found: {chart_path}")
-                # Update bot response to exclude chart path
-                bot_response_content = bot_response_content.replace(chart_path, "").strip()
-                if bot_response_content:
-                    message_placeholder.markdown(bot_response_content)
+                
+                # Render Text Analysis (Cleaning path from text)
+                clean_text = raw_response.replace(chart_path, "").strip()
+                if clean_text:
+                    placeholder.markdown(clean_text) # Re-use placeholder for text
                     st.session_state.messages.append({
                         "role": "assistant", 
-                        "content": bot_response_content,
+                        "content": clean_text,
                         "is_html": False
                     })
-                    
             else:
-                # === RENDER TEXT ===
-                message_placeholder.markdown(bot_response_content)
+                # Text Only Response
+                placeholder.markdown(raw_response)
                 st.session_state.messages.append({
                     "role": "assistant", 
-                    "content": bot_response_content,
+                    "content": raw_response,
                     "is_html": False
                 })
 
         except Exception as e:
-            message_placeholder.error(f"An error occurred: {str(e)}")
+            placeholder.error(f"An error occurred: {str(e)}")
+
+# =============================================================================
+# 4. MAIN APP LOOP
+# =============================================================================
+
+def main():
+    initialize_session()
+    
+    st.title("📈 Trader Companion AI")
+    st.caption("Interactive Technical Analysis & Document Search powered by LangGraph.")
+    
+    # Render Layout
+    use_rag = render_sidebar()
+    render_chat_history()
+    
+    # Chat Input
+    if prompt := st.chat_input("Ask about a stock (e.g., 'Analyze Nvidia') or your PDF..."):
+        handle_user_input(prompt, use_rag)
+
+if __name__ == "__main__":
+    main()

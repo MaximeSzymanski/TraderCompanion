@@ -1,7 +1,13 @@
 # ---- Base image ----
 FROM python:3.12-slim
 
-# 1. EN TANT QUE ROOT : Installations système
+# ---- Environment variables ----
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_SERVER_PORT=8501
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
+
 # On installe curl ET Ollama tout de suite, car on a les droits admin ici.
 RUN apt-get update && apt-get install -y \
     build-essential \
