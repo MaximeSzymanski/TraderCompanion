@@ -1,32 +1,34 @@
 # ---- Base image ----
 FROM python:3.12-slim
 
-# ---- Environment variables ----
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV STREAMLIT_SERVER_HEADLESS=true
-ENV STREAMLIT_SERVER_PORT=8501
-ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
-
-# ---- System dependencies ----
+# 1. EN TANT QUE ROOT : Installations système
+# On installe curl ET Ollama tout de suite, car on a les droits admin ici.
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://ollama.com/install.sh | sh
 
-# ---- Working directory ----
-WORKDIR /app
+# 2. Création de l'utilisateur sécurisé (pour Hugging Face)
+RUN useradd -m -u 1000 user
 
-# ---- Install Python dependencies ----
-COPY requirements.txt .
+# 3. ON CHANGE D'UTILISATEUR MAINTENANT
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+
+WORKDIR $HOME/app
+
+# 4. Installation des dépendances Python (en tant que user)
+COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Copy project files ----
-COPY . .
+# 5. Copie du reste des fichiers
+COPY --chown=user . .
 
-# ---- Expose Streamlit port ----
-EXPOSE 8501
+# 6. Permissions sur le script de démarrage
+RUN chmod +x start.sh
 
-# ---- Run Streamlit ----
-CMD ["streamlit", "run", "app.py"]
+EXPOSE 7860
+
+CMD ["./start.sh"]
