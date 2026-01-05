@@ -1,27 +1,3 @@
----
-title: Trader Companion AI
-emoji: 📈
-colorFrom: blue
-colorTo: green
-sdk: docker
-python_version: "3.11"
-app_file: app.py
-app_port: 7860
-fullWidth: true
-header: default
-short_description: Autonomous financial agent.
-tags:
-  - finance
-  - stocks
-  - technical-analysis
-  - RAG
-  - forecast
-  - agent
-  - langgraph
-  - ollama
----
-
-
 # 📈 Trader Companion AI
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
